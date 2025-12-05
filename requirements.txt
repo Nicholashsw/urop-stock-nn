@@ -1,8 +1,9 @@
 streamlit
+yfinance
 pandas
 numpy
-yfinance
+matplotlib
 scikit-learn
 torch
+EOF
 torchvision
-matplotlib
