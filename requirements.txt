@@ -4,6 +4,6 @@ pandas
 numpy
 matplotlib
 scikit-learn
-torch
+torch==2.3.1
+torchvision==0.18.1
 EOF
-torchvision
