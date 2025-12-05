@@ -26,6 +26,7 @@ DEVICE = cfg.DEVICE
 
 # ---------- Model definition ----------
 
+
 class LSTMRegressor(nn.Module):
     def __init__(self, input_size: int = 1, hidden_size: int = 64, num_layers: int = 2):
         super().__init__()
@@ -45,6 +46,7 @@ class LSTMRegressor(nn.Module):
 
 
 # ---------- Utilities ----------
+
 
 def load_price_history(
     symbol: str,
@@ -106,6 +108,7 @@ def load_processed_arrays(symbol: str):
 # IMPORTANT: match sklearn MinMaxScaler
 # scaled = (raw - min_) / scale_
 # raw    = scaled * scale_ + min_
+
 
 def scale_values(raw: np.ndarray, scaler_params: np.lib.npyio.NpzFile) -> np.ndarray:
     """Scale raw prices into [0,1] using saved min_ and scale_."""
@@ -225,6 +228,7 @@ def select_period_label(label: str) -> str | None:
 
 # ---------- Streamlit app ----------
 
+
 def main():
     # Page title in browser tab
     st.set_page_config(page_title="Equity Model Lab", layout="wide")
@@ -237,7 +241,6 @@ def main():
         "Interactive research console for stock price prediction with neural networks "
         "and time series benchmark models."
     )
-
 
     st.sidebar.header("Mode and universe")
 
@@ -387,14 +390,14 @@ def main():
         else:
             col_a, col_b = st.columns(2)
             with col_a:
-                st.write("**Name**", info.get("longName") or info.get("shortName"))
-                st.write("**Sector**", info.get("sector"))
-                st.write("**Industry**", info.get("industry"))
+                st.write("*Name*", info.get("longName") or info.get("shortName"))
+                st.write("*Sector*", info.get("sector"))
+                st.write("*Industry*", info.get("industry"))
             with col_b:
-                st.write("**Market cap**", f"{info.get('marketCap'):,}" if info.get("marketCap") else "N/A")
-                st.write("**Trailing PE**", info.get("trailingPE"))
-                st.write("**Forward PE**", info.get("forwardPE"))
-                st.write("**Beta**", info.get("beta"))
+                st.write("*Market cap*", f"{info.get('marketCap'):,}" if info.get("marketCap") else "N/A")
+                st.write("*Trailing PE*", info.get("trailingPE"))
+                st.write("*Forward PE*", info.get("forwardPE"))
+                st.write("*Beta*", info.get("beta"))
 
 
 if __name__ == "__main__":
