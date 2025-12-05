@@ -2,4 +2,5 @@ streamlit
 numpy
 pandas
 yfinance
-torch==2.2.0
+matplotlib
+scikit-learn
