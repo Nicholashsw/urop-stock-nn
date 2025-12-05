@@ -1,403 +1,227 @@
-import sys
+import math
 from pathlib import Path
-
-# Make src importable no matter where Streamlit runs from
-ROOT = Path(__file__).resolve().parent.parent  # .../urop-stock-nn
-SRC_PATH = ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
-from torch import nn
-import yfinance as yf
-
-import config as cfg  # src/config.py
-
-EXPERIMENT_SYMBOLS = cfg.EXPERIMENT_SYMBOLS
-DEFAULT_SYMBOL = cfg.DEFAULT_SYMBOL
-LOOKBACK = cfg.LOOKBACK
-TEST_SIZE = cfg.TEST_SIZE
-MODELS_DIR = cfg.MODELS_DIR
-DATA_PROCESSED_DIR = cfg.DATA_PROCESSED_DIR
-DEVICE = cfg.DEVICE
-
-# ---------- Model definition ----------
 
 
-class LSTMRegressor(nn.Module):
-    def __init__(self, input_size: int = 1, hidden_size: int = 64, num_layers: int = 2):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-        )
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        last = out[:, -1, :]
-        out = self.fc(last)
-        return out
+# List of symbols we generated outputs for
+SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
+    "ADBE", "AMD", "CRM", "NFLX", "AVGO", "COST", "WMT", "MCD", "DIS",
+    "HD", "KO", "PEP", "JPM", "GS", "SCHW", "V", "MA", "UNH", "ABBV",
+    "TMO", "PFE", "JNJ", "XOM", "CVX", "CAT", "BA", "VZ", "T", "TM",
+    "MC.PA", "^GSPC", "^NDX", "^DJI", "SPY", "QQQ", "DIA",
+]
 
 
-# ---------- Utilities ----------
+DATA_DIR = Path("data/outputs")
 
 
-def load_price_history(
-    symbol: str,
-    period: str | None = None,
-    start: str | None = None,
-    end: str | None = None,
-) -> pd.DataFrame:
-    """Download daily data for a single symbol."""
-    if period is not None:
-        df = yf.download(symbol, period=period, interval="1d", progress=False, threads=False)
-    else:
-        df = yf.download(symbol, start=start, end=end, interval="1d", progress=False, threads=False)
+def load_symbol_data(symbol: str) -> pd.DataFrame:
+    """
+    Load precomputed outputs for a symbol from data/outputs.
+    Returns an empty DataFrame if the file does not exist or is invalid.
+    """
+    csv_path = DATA_DIR / f"{symbol}_lstm_results.csv"
+    if not csv_path.exists():
+        return pd.DataFrame()
 
-    if df is None or df.empty:
-        raise RuntimeError(f"No data for {symbol} with period={period}, start={start}, end={end}")
+    try:
+        df = pd.read_csv(csv_path, parse_dates=["date"])
+    except Exception as e:
+        st.error(f"Could not read CSV for {symbol}: {e}")
+        return pd.DataFrame()
 
-    # If MultiIndex appears (should not for single ticker, but just in case), flatten it
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(c) for c in col if c]) for col in df.columns]
+    # Basic sanity check
+    required_cols = [
+        "date",
+        "close",
+        "return",
+        "naive_pred",
+        "lstm_pred",
+        "direction_true",
+        "direction_lstm",
+        "signal",
+        "strategy_return",
+        "bh_return",
+        "cum_strategy",
+        "cum_bh",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"{symbol}_lstm_results.csv is missing columns: {missing}")
+        return pd.DataFrame()
 
-    df = df.sort_index()
-    df.index.name = "Date"
+    df = df.sort_values("date").reset_index(drop=True)
     return df
 
 
-def choose_price_column(df: pd.DataFrame, desired: str) -> str:
-    cols = list(df.columns)
-
-    # exact match
-    if desired in cols:
-        return desired
-
-    # flattened like "Adj Close_AAPL"
-    prefix_matches = [c for c in cols if c.startswith(desired)]
-    if prefix_matches:
-        return prefix_matches[0]
-
-    # fallbacks
-    for base in ["Adj Close", "Close", "Open", "High", "Low"]:
-        if base in cols:
-            return base
-        cand = [c for c in cols if c.startswith(base)]
-        if cand:
-            return cand[0]
-
-    # last resort
-    return cols[0]
+def compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if mask.sum() == 0:
+        return math.nan
+    mse = np.mean((y_true[mask] - y_pred[mask]) ** 2)
+    return float(np.sqrt(mse))
 
 
-def load_processed_arrays(symbol: str):
-    X_train = np.load(DATA_PROCESSED_DIR / f"{symbol}_X_train.npy")
-    y_train = np.load(DATA_PROCESSED_DIR / f"{symbol}_y_train.npy")
-    X_test = np.load(DATA_PROCESSED_DIR / f"{symbol}_X_test.npy")
-    y_test = np.load(DATA_PROCESSED_DIR / f"{symbol}_y_test.npy")
-    scaler_params = np.load(DATA_PROCESSED_DIR / f"{symbol}_scaler.npz")
-    return X_train, y_train, X_test, y_test, scaler_params
+def compute_directional_accuracy(direction_true: np.ndarray,
+                                 direction_pred: np.ndarray) -> float:
+    mask = np.isfinite(direction_true) & np.isfinite(direction_pred)
+    if mask.sum() == 0:
+        return math.nan
+    hits = (direction_true[mask] == direction_pred[mask]).astype(float)
+    return float(hits.mean())
 
 
-# IMPORTANT: match sklearn MinMaxScaler
-# scaled = (raw - min_) / scale_
-# raw    = scaled * scale_ + min_
-
-
-def scale_values(raw: np.ndarray, scaler_params: np.lib.npyio.NpzFile) -> np.ndarray:
-    """Scale raw prices into [0,1] using saved min_ and scale_."""
-    min_ = scaler_params["min_"]
-    scale_ = scaler_params["scale_"]
-    raw_2d = raw.reshape(-1, 1)
-    return (raw_2d - min_) / scale_
-
-
-def inverse_scale(scaled: np.ndarray, scaler_params: np.lib.npyio.NpzFile) -> np.ndarray:
-    """Inverse-transform scaled values back to original price space."""
-    min_ = scaler_params["min_"]
-    scale_ = scaler_params["scale_"]
-    scaled_2d = scaled.reshape(-1, 1)
-    return (scaled_2d * scale_) + min_
-
-
-def get_dates_for_test(df: pd.DataFrame) -> pd.DatetimeIndex:
-    n = len(df)
-    split_idx = int(n * (1.0 - TEST_SIZE))
-    return df.index[split_idx:]
-
-
-def load_trained_model(symbol: str) -> LSTMRegressor | None:
-    model_path = MODELS_DIR / f"lstm_{symbol}.pt"
-    if not model_path.exists():
-        return None
-
-    model = LSTMRegressor(input_size=1)
-    state_dict = torch.load(model_path, map_location=DEVICE)
-    model.load_state_dict(state_dict)
-    model.to(DEVICE)
-    model.eval()
-    return model
-
-
-def compute_baselines(targets_price: np.ndarray) -> dict[str, np.ndarray]:
-    naive = np.concatenate([[targets_price[0]], targets_price[:-1]])
-    ma5 = pd.Series(targets_price).rolling(window=5, min_periods=1).mean().values
-    ma20 = pd.Series(targets_price).rolling(window=20, min_periods=1).mean().values
-
-    return {
-        "Naive lag1": naive,
-        "MA 5 day": ma5,
-        "MA 20 day": ma20,
-    }
-
-
-def compute_metrics(pred: np.ndarray, actual: np.ndarray) -> tuple[float, float]:
-    mae = float(np.mean(np.abs(pred - actual)))
-    rmse = float(np.sqrt(np.mean((pred - actual) ** 2)))
-    return mae, rmse
-
-
-def forecast_next_days(
-    model: LSTMRegressor,
-    df: pd.DataFrame,
-    scaler_params: np.lib.npyio.NpzFile,
-    price_col: str,
-    n_steps: int = 5,
-) -> pd.DataFrame:
-    closes = df[price_col].values
-    if len(closes) < LOOKBACK:
-        return pd.DataFrame()
-
-    last_window_raw = closes[-LOOKBACK:]
-    last_window_scaled = scale_values(last_window_raw, scaler_params)
-    window = last_window_scaled.copy()
-
-    preds_scaled = []
-    for _ in range(n_steps):
-        x = torch.tensor(window.reshape(1, LOOKBACK, 1), dtype=torch.float32).to(DEVICE)
-        with torch.inference_mode():
-            y_scaled = model(x).cpu().numpy().reshape(-1)
-        preds_scaled.append(y_scaled[0])
-        window = np.concatenate([window[1:], y_scaled.reshape(1, 1)], axis=0)
-
-    preds_scaled_arr = np.array(preds_scaled).reshape(-1, 1)
-    preds_price = inverse_scale(preds_scaled_arr, scaler_params).reshape(-1)
-
-    last_date = df.index[-1]
-    future_dates = pd.date_range(last_date, periods=n_steps + 1, freq="B")[1:]
-
-    return pd.DataFrame({"LSTM forecast": preds_price}, index=future_dates)
-
-
-def get_ticker_info(symbol: str) -> dict:
-    try:
-        t = yf.Ticker(symbol)
-        info = t.info
-    except Exception:
-        info = {}
-    wanted = {
-        "shortName": info.get("shortName"),
-        "longName": info.get("longName"),
-        "sector": info.get("sector"),
-        "industry": info.get("industry"),
-        "marketCap": info.get("marketCap"),
-        "trailingPE": info.get("trailingPE"),
-        "forwardPE": info.get("forwardPE"),
-        "beta": info.get("beta"),
-    }
-    return wanted
-
-
-def select_period_label(label: str) -> str | None:
-    mapping = {
-        "1M": "1mo",
-        "3M": "3mo",
-        "6M": "6mo",
-        "1Y": "1y",
-        "5Y": "5y",
-        "Max": "max",
-    }
-    return mapping.get(label, "1y")
-
-
-# ---------- Streamlit app ----------
+def compute_sharpe(returns: np.ndarray, trading_days: int = 252) -> float:
+    returns = returns[np.isfinite(returns)]
+    if returns.size == 0:
+        return math.nan
+    mu = returns.mean()
+    sigma = returns.std(ddof=1)
+    if sigma == 0:
+        return math.nan
+    return float(mu / sigma * math.sqrt(trading_days))
 
 
 def main():
-    # Page title in browser tab
-    st.set_page_config(page_title="Equity Model Lab", layout="wide")
-
-    # Main title in the app
-    st.title("Equity Model Lab")
-
-    # Short description under the title
-    st.caption(
-        "Interactive research console for stock price prediction with neural networks "
-        "and time series benchmark models."
+    st.set_page_config(
+        page_title="Neural Network Stock Prediction",
+        layout="wide",
     )
 
-    st.sidebar.header("Mode and universe")
+    st.title("App for Predicting Stock Price Fluctuations with Neural Networks")
 
-    mode = st.sidebar.radio("Mode", ["Predefined universe", "Custom symbol"])
+    st.markdown(
+        """
+This Streamlit app visualises **precomputed outputs** from a simple
+neural network style pipeline.  
+For each symbol we load:
 
-    if mode == "Predefined universe":
-        symbol = st.sidebar.selectbox(
-            "Choose asset",
-            options=EXPERIMENT_SYMBOLS,
-            index=EXPERIMENT_SYMBOLS.index(DEFAULT_SYMBOL),
+- Daily prices
+- Naive baseline predictions (random walk)
+- A lightweight LSTM like proxy signal
+- A simple long only strategy driven by the signal
+        """
+    )
+
+    # Sidebar controls
+    with st.sidebar:
+        st.header("Controls")
+        symbol = st.selectbox("Select symbol", SYMBOLS, index=0)
+
+        st.caption(
+            "All results are loaded from CSV files in `data/outputs/`. "
+            "No live data download and no torch is used at runtime."
         )
-    else:
-        symbol = st.sidebar.text_input("Enter Yahoo Finance symbol", value="AAPL").strip().upper()
 
-    window_label = st.sidebar.selectbox(
-        "Time window",
-        options=["1M", "3M", "6M", "1Y", "5Y", "Max"],
-        index=3,
-    )
+    df = load_symbol_data(symbol)
 
-    forecast_horizon = st.sidebar.slider(
-        "Forecast horizon (days ahead)",
-        min_value=1,
-        max_value=10,
-        value=5,
-    )
-
-    price_field = st.sidebar.selectbox(
-        "Price field",
-        options=["Adj Close", "Close", "Open", "High", "Low"],
-        index=0,
-    )
-
-    period = select_period_label(window_label)
-
-    tabs = st.tabs(["Overview", "Models", "Fundamentals"])
-
-    # Data loading with proper error handling
-    try:
-        with st.spinner(f"Loading price history for {symbol}"):
-            df_full = load_price_history(symbol, period=period)
-    except Exception as e:
-        for tab in tabs:
-            with tab:
-                st.error(f"Could not load data for {symbol}: {e}")
+    if df.empty:
+        st.warning(
+            f"No precomputed data available for {symbol}. "
+            f"Run `python scripts/generate_all_outputs.py` locally "
+            f"and commit the CSVs to the repo."
+        )
         return
 
-    price_col = choose_price_column(df_full, price_field)
-    df = df_full.copy()
+    # Latest snapshot
+    latest = df.iloc[-1]
+    latest_price = latest["close"]
+    latest_date = latest["date"]
 
-    # -------- Overview tab --------
-    with tabs[0]:
-        st.subheader(f"{symbol} price overview")
+    # Metrics
+    rmse_naive = compute_rmse(df["return"].values, df["naive_pred"].values)
+    rmse_lstm = compute_rmse(df["return"].values, df["lstm_pred"].values)
 
-        price_series = df[price_col].rename("Price")
-        st.line_chart(price_series)
+    da_lstm = compute_directional_accuracy(
+        df["direction_true"].values,
+        df["direction_lstm"].values,
+    )
 
-        st.write("Recent daily data")
-        cols_to_show = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-        if cols_to_show:
-            st.dataframe(
-                df[cols_to_show].tail(15),
-                use_container_width=True,
-            )
-        else:
-            st.info("No OHLCV columns available to display.")
+    sharpe_strategy = compute_sharpe(df["strategy_return"].values)
+    sharpe_bh = compute_sharpe(df["bh_return"].values)
 
-    # -------- Models tab --------
-    with tabs[1]:
-        st.subheader(f"{symbol} model comparison on test set")
+    cum_strategy = float(df["cum_strategy"].iloc[-1])
+    cum_bh = float(df["cum_bh"].iloc[-1])
 
-        model = load_trained_model(symbol) if mode == "Predefined universe" else None
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Latest close",
+            f"{latest_price:,.2f}",
+            help=f"As of {latest_date.date()}",
+        )
+    with col2:
+        st.metric(
+            "Cumulative return (strategy)",
+            f"{(cum_strategy - 1.0) * 100:,.1f} %",
+        )
+    with col3:
+        st.metric(
+            "Cumulative return (buy and hold)",
+            f"{(cum_bh - 1.0) * 100:,.1f} %",
+        )
 
-        if model is None:
-            st.info(
-                "LSTM model is available only for symbols in the predefined universe "
-                "that you have trained. For other symbols, only price overview is shown."
-            )
-        else:
-            try:
-                _, _, X_test, y_test, scaler_params = load_processed_arrays(symbol)
-            except FileNotFoundError:
-                st.error(
-                    f"Processed arrays for {symbol} not found. "
-                    f"Run the preprocessing and training scripts first."
-                )
-            else:
-                X_test_t = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
-                with torch.inference_mode():
-                    preds_t = model(X_test_t)
-                preds_scaled = preds_t.cpu().numpy().reshape(-1, 1)
-                targets_scaled = y_test.reshape(-1, 1)
+    st.markdown("### Model vs Baseline (Error and Direction)")
 
-                preds_price = inverse_scale(preds_scaled, scaler_params).reshape(-1)
-                targets_price = inverse_scale(targets_scaled, scaler_params).reshape(-1)
+    col4, col5 = st.columns(2)
+    with col4:
+        st.write("#### RMSE on daily returns")
+        st.write(f"Naive baseline: **{rmse_naive:.6f}**")
+        st.write(f"LSTM like proxy: **{rmse_lstm:.6f}**")
+    with col5:
+        st.write("#### Directional accuracy")
+        st.write(f"LSTM like proxy: **{da_lstm * 100:.2f} %**")
 
-                dates_test_full = get_dates_for_test(df_full)
-                L = min(len(dates_test_full), len(preds_price), len(targets_price))
-                dates_test = dates_test_full[-L:]
-                preds_price = preds_price[-L:]
-                targets_price = targets_price[-L:]
+    st.markdown("### Price and Strategy Behaviour")
 
-                baselines = compute_baselines(targets_price)
+    tab1, tab2 = st.tabs(["Price and signals", "Equity curves"])
 
-                data_dict = {"Actual": targets_price, "LSTM": preds_price}
-                data_dict.update(baselines)
-                results_df = pd.DataFrame(data_dict, index=dates_test)
+    with tab1:
+        chart_df = df[["date", "close"]].copy()
+        chart_df = chart_df.rename(columns={"date": "Date", "close": "Close"})
+        st.line_chart(chart_df, x="Date", y="Close", height=350)
 
-                st.line_chart(results_df)
+        st.caption(
+            "Price series used to generate returns and model signals. "
+            "Naive and LSTM like predictions are applied on returns, not prices."
+        )
 
-                rows = []
-                mae_lstm, rmse_lstm = compute_metrics(preds_price, targets_price)
-                rows.append({"Model": "LSTM", "MAE": mae_lstm, "RMSE": rmse_lstm})
+    with tab2:
+        eq_df = df[["date", "cum_strategy", "cum_bh"]].copy()
+        eq_df = eq_df.rename(
+            columns={
+                "date": "Date",
+                "cum_strategy": "Strategy",
+                "cum_bh": "Buy and hold",
+            }
+        )
+        st.line_chart(eq_df, x="Date", y=["Strategy", "Buy and hold"], height=350)
 
-                for name, pred in baselines.items():
-                    mae, rmse = compute_metrics(pred, targets_price)
-                    rows.append({"Model": name, "MAE": mae, "RMSE": rmse})
+        st.write("#### Sharpe ratios (daily returns, annualised)")
+        st.write(f"Strategy Sharpe: **{sharpe_strategy:.3f}**")
+        st.write(f"Buy and hold Sharpe: **{sharpe_bh:.3f}**")
 
-                metrics_df = pd.DataFrame(rows).set_index("Model")
-                st.write("Error metrics on test set")
-                st.dataframe(metrics_df.style.format({"MAE": "{:.4f}", "RMSE": "{:.4f}"}))
+    st.markdown(
+        """
+### Interpretation
 
-                st.write("Short horizon LSTM forecast")
+These results are **illustrative**:
 
-                forecast_df = forecast_next_days(
-                    model=model,
-                    df=df_full,
-                    scaler_params=scaler_params,
-                    price_col=price_col,
-                    n_steps=forecast_horizon,
-                )
+- The naive baseline is the one day random walk.
+- The LSTM like proxy is a rolling average of returns.
+- The long only strategy goes long when the proxy is positive.
 
-                if forecast_df.empty:
-                    st.info("Not enough history to compute forecast.")
-                else:
-                    hist = df_full[[price_col]].tail(60).rename(columns={price_col: "History"})
-                    combined = pd.concat([hist, forecast_df], axis=0)
-                    st.line_chart(combined)
-                    st.dataframe(forecast_df)
+This mirrors the structure of your UROP report:
 
-    # -------- Fundamentals tab --------
-    with tabs[2]:
-        st.subheader(f"{symbol} fundamentals snapshot")
-        info = get_ticker_info(symbol)
-        if not info.get("shortName") and not info.get("longName"):
-            st.info("Fundamental info not available for this symbol.")
-        else:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.write("*Name*", info.get("longName") or info.get("shortName"))
-                st.write("*Sector*", info.get("sector"))
-                st.write("*Industry*", info.get("industry"))
-            with col_b:
-                st.write("*Market cap*", f"{info.get('marketCap'):,}" if info.get("marketCap") else "N/A")
-                st.write("*Trailing PE*", info.get("trailingPE"))
-                st.write("*Forward PE*", info.get("forwardPE"))
-                st.write("*Beta*", info.get("beta"))
+- Compare naive vs neural style model
+- Evaluate both statistical error and trading behaviour
+- Show that small edges are hard and markets are noisy
+        """
+    )
 
 
 if __name__ == "__main__":
