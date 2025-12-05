@@ -1,9 +1,5 @@
 streamlit
-yfinance
-pandas
 numpy
-matplotlib
-scikit-learn
-torch==2.3.1
-torchvision==0.18.1
-EOF
+pandas
+yfinance
+torch==2.2.0
