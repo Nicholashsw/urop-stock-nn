@@ -1,319 +1,278 @@
-import math
+# app/streamlit_app.py
+
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
-import altair as alt
 
-# ============================================================
-# Paths and config
-# ============================================================
+# Directory where precomputed CSVs live, relative to repo root
+OUTPUT_DIR = Path("data") / "outputs"
 
-# Repo root: .../urop-stock-nn
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "outputs"
-
-st.set_page_config(
-    page_title="Neural Network Stock Prediction Demo",
-    page_icon="📈",
-    layout="wide",
-)
-
-# ============================================================
-# Symbol universe
-# ============================================================
-
+# Universe of symbols supported by the app
 SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "ADBE",
-    "AMD", "CRM", "NFLX", "AVGO", "COST", "WMT", "MCD", "DIS", "HD", "KO",
-    "PEP", "JPM", "GS", "SCHW", "V", "MA", "UNH", "ABBV", "TMO", "PFE", "JNJ",
-    "XOM", "CVX", "CAT", "BA", "VZ", "T", "TM", "MC.PA",
-    "^GSPC", "^NDX", "^DJI",
-    "SPY", "QQQ", "DIA",
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
+    "ADBE", "AMD", "CRM", "NFLX", "AVGO", "COST", "WMT", "MCD", "DIS",
+    "HD", "KO", "PEP", "JPM", "GS", "SCHW", "V", "MA", "UNH", "ABBV",
+    "TMO", "PFE", "JNJ", "XOM", "CVX", "CAT", "BA", "VZ", "T", "TM",
+    "MC.PA", "^GSPC", "^NDX", "^DJI", "SPY", "QQQ", "DIA",
 ]
 
 
-# ============================================================
-# Helpers
-# ============================================================
+# ---------- Data loading utilities ----------
 
 @st.cache_data(show_spinner=False)
-def load_symbol(symbol: str) -> pd.DataFrame:
+def load_symbol(symbol: str) -> pd.DataFrame | None:
     """
-    Load precomputed CSV output for the given symbol.
+    Load precomputed CSV for a given symbol.
 
-    Expected filename: data/outputs/{symbol}_lstm_results.csv
-
-    The function is defensive:
-    - returns empty DataFrame if file missing or unreadable
-    - parses Date column to datetime if present
+    Returns:
+        DataFrame with at least Date and Close columns,
+        or None if file is missing or invalid.
     """
-    file_path = DATA_DIR / f"{symbol}_lstm_results.csv"
+    filepath = OUTPUT_DIR / f"{symbol}_lstm_results.csv"
 
-    if not file_path.exists():
-        return pd.DataFrame()
+    if not filepath.exists():
+        st.warning(f"No CSV file found for {symbol}. Expected at: {filepath}")
+        return None
 
     try:
-        df = pd.read_csv(file_path)
-
-        # Handle possible index column from pandas to_csv
-        if "Unnamed: 0" in df.columns:
-            df = df.drop(columns=["Unnamed: 0"])
-
-        # Standardise date column name if possible
-        date_cols = [c for c in df.columns if c.lower() in ["date", "timestamp"]]
-        if date_cols:
-            date_col = date_cols[0]
-            df[date_col] = pd.to_datetime(df[date_col])
-            df = df.sort_values(date_col)
-        else:
-            # Create a fake date index if none exists, just to allow plotting
-            df = df.copy()
-            df["index"] = np.arange(len(df))
-            date_col = "index"
-
-        df = df.reset_index(drop=True)
-        return df, date_col
+        df = pd.read_csv(filepath)
     except Exception as e:
-        st.error(f"Failed to load {file_path.name}: {e}")
-        return pd.DataFrame(), None
+        st.error(f"Failed to read CSV for {symbol}: {e}")
+        return None
 
+    if df is None or df.empty:
+        st.warning(f"CSV for {symbol} is empty. Skipping.")
+        return None
 
-def pick_price_column(df: pd.DataFrame) -> str | None:
-    """
-    Try to choose a reasonable price column for plotting.
-    """
-    candidates = ["Close", "Adj Close", "close", "adj_close", "Price", "price"]
-    for c in candidates:
+    # Try to normalise the date column
+    date_col_candidates = ["Date", "date", "Timestamp", "timestamp"]
+    date_col = None
+    for c in date_col_candidates:
         if c in df.columns:
-            return c
-    # Fallback to first numeric column
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    return numeric_cols[0] if numeric_cols else None
+            date_col = c
+            break
+
+    if date_col is None:
+        # If no explicit date, try using index
+        if df.index.name is not None:
+            df = df.reset_index()
+            if df.columns[0].lower().startswith("date"):
+                date_col = df.columns[0]
+            else:
+                st.warning(f"{symbol}: could not locate a Date column. Using row index as proxy.")
+                df["Date"] = np.arange(len(df))
+                date_col = "Date"
+        else:
+            st.warning(f"{symbol}: no Date column found. Using row index as proxy.")
+            df["Date"] = np.arange(len(df))
+            date_col = "Date"
+
+    # Ensure Date is datetime when possible
+    try:
+        df[date_col] = pd.to_datetime(df[date_col])
+    except Exception:
+        # If conversion fails, keep as is
+        pass
+
+    # Normalise to a standard "Date" column
+    if date_col != "Date":
+        df = df.rename(columns={date_col: "Date"})
+
+    # Try to locate a price column
+    price_col = None
+    for c in ["Close", "close", "Adj Close", "Adj_Close", "adj_close"]:
+        if c in df.columns:
+            price_col = c
+            break
+
+    if price_col is None:
+        # Sometimes yfinance multi index can end up flattened like "Close.AAPL"
+        for c in df.columns:
+            if "close" in c.lower():
+                price_col = c
+                break
+
+    if price_col is None:
+        st.error(f"{symbol}: no close price column found in CSV. Columns: {list(df.columns)}")
+        return None
+
+    # Rename price column to Close for plotting
+    if price_col != "Close":
+        df = df.rename(columns={price_col: "Close"})
+
+    # Drop rows with missing Close
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        st.warning(f"{symbol}: all Close values are NaN after cleaning. Skipping.")
+        return None
+
+    # Sort by Date just in case
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    # Create a simple "prediction" series if not already present
+    if "Predicted_Close" not in df.columns:
+        # Use previous day Close as a naive forecast
+        df["Predicted_Close"] = df["Close"].shift(1)
+        # First row has no prediction so we drop it to keep arrays aligned
+        df = df.dropna(subset=["Predicted_Close"]).reset_index(drop=True)
+
+    return df
 
 
-def pick_prediction_columns(df: pd.DataFrame) -> list[str]:
+def compute_basic_metrics(df: pd.DataFrame) -> dict:
     """
-    Try to find prediction columns if available.
+    Compute simple metrics from actual and predicted close prices.
     """
-    candidates = [
-        "pred_lstm", "lstm_pred", "y_pred_lstm",
-        "pred_naive", "naive_pred",
-        "pred_ma", "ma_pred",
-    ]
-    found = [c for c in candidates if c in df.columns]
-    # Remove duplicates while preserving order
-    seen = set()
-    unique = []
-    for c in found:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return unique
+    actual = df["Close"].values
+    pred = df["Predicted_Close"].values
 
+    # Align lengths if needed
+    n = min(len(actual), len(pred))
+    actual = actual[-n:]
+    pred = pred[-n:]
 
-def compute_simple_metrics(df: pd.DataFrame, price_col: str, pred_col: str | None):
-    """
-    Compute simple performance metrics:
-    - last price
-    - last return
-    - RMSE if prediction column present
-    - directional accuracy if prediction column present and target exists
-    """
-    out = {}
-
-    prices = df[price_col].astype(float)
-    if len(prices) >= 2:
-        last_price = prices.iloc[-1]
-        prev_price = prices.iloc[-2]
-        last_ret = (last_price / prev_price) - 1.0
-        out["last_price"] = last_price
-        out["last_return"] = last_ret
-    else:
-        out["last_price"] = None
-        out["last_return"] = None
-
-    if pred_col is None:
-        return out
-
-    y_cols = [c for c in df.columns if c.lower() in ["target", "y_true", "true", "return"]]
-    if not y_cols:
-        return out
-
-    y_col = y_cols[0]
-    y_true = df[y_col].astype(float)
-    y_pred = df[pred_col].astype(float)
-
-    if len(y_true) != len(y_pred) or len(y_true) == 0:
-        return out
-
-    mse = np.mean((y_true - y_pred) ** 2)
-    rmse = math.sqrt(mse)
-    out["rmse"] = rmse
+    # RMSE
+    rmse = np.sqrt(np.mean((actual - pred) ** 2))
 
     # Directional accuracy
-    sign_true = np.sign(y_true.values)
-    sign_pred = np.sign(y_pred.values)
-    correct = (sign_true == sign_pred).sum()
-    da = correct / len(y_true)
-    out["directional_accuracy"] = da
+    actual_ret = np.sign(np.diff(actual))
+    pred_ret = np.sign(np.diff(pred))
+    m = min(len(actual_ret), len(pred_ret))
+    if m > 0:
+        da = np.mean(actual_ret[-m:] == pred_ret[-m:])
+    else:
+        da = np.nan
 
-    return out
+    # Simple cumulative return of buy and hold
+    if len(actual) > 1:
+        daily_ret = np.diff(actual) / actual[:-1]
+        cum_ret = np.prod(1 + daily_ret) - 1
+    else:
+        cum_ret = np.nan
 
-
-def make_price_chart(df: pd.DataFrame, date_col: str, price_col: str, preds: list[str]):
-    """
-    Build Altair chart: price series and optional prediction overlays.
-    """
-    base = alt.Chart(df).encode(
-        x=alt.X(date_col, title="Date"),
-    )
-
-    price_line = base.mark_line().encode(
-        y=alt.Y(price_col, title="Price"),
-        color=alt.value("#1f77b4"),
-    )
-
-    layers = [price_line]
-
-    color_map = {
-        "pred_lstm": "#d62728",
-        "lstm_pred": "#d62728",
-        "y_pred_lstm": "#d62728",
-        "pred_ma": "#2ca02c",
-        "ma_pred": "#2ca02c",
-        "pred_naive": "#ff7f0e",
-        "naive_pred": "#ff7f0e",
+    return {
+        "rmse": rmse,
+        "directional_accuracy": da,
+        "cum_return": cum_ret,
     }
 
-    for col in preds:
-        if col not in df.columns:
-            continue
-        line = base.mark_line(strokeDash=[4, 3]).encode(
-            y=alt.Y(col, title=""),
-            color=alt.value(color_map.get(col, "#888888")),
-        )
-        layers.append(line)
 
-    chart = alt.layer(*layers).resolve_scale(y="shared").interactive()
-    return chart
+# ---------- Streamlit app layout ----------
 
-
-# ============================================================
-# Layout
-# ============================================================
-
-st.title("📈 Neural Network Stock Prediction Demo")
-
-st.markdown(
-    """
-This app visualises **precomputed outputs** from your UROP stock prediction project.
-
-It reads CSV files from `data/outputs/` and shows:
-
-- Price history for the selected symbol  
-- Optional neural network or baseline predictions, if present in the CSV  
-- Simple metrics such as last price, last return, and RMSE if targets are available  
-
-All heavy lifting (training, downloading, backtesting) was done **offline**.
-"""
-)
-
-# Sidebar controls
-st.sidebar.header("Controls")
-
-symbol = st.sidebar.selectbox("Select symbol", SYMBOLS, index=0)
-
-lookback_years = st.sidebar.slider(
-    "Lookback (years)",
-    min_value=1,
-    max_value=10,
-    value=3,
-    step=1,
-)
-
-st.sidebar.info(
-    "Data and predictions are loaded from precomputed CSV files. "
-    "No live API calls are made inside this app."
-)
-
-# ============================================================
-# Main content
-# ============================================================
-
-df, date_col = load_symbol(symbol)
-
-if df is None or df.empty or date_col is None:
-    st.error(
-        f"No data available for {symbol}. "
-        f"Check that `data/outputs/{symbol}_lstm_results.csv` exists in the repo."
-    )
-    st.stop()
-
-price_col = pick_price_column(df)
-pred_cols = pick_prediction_columns(df)
-
-if price_col is None:
-    st.error("Could not identify a price column to plot.")
-    st.write("Columns found:", list(df.columns))
-    st.stop()
-
-# Filter by lookback
-if df[date_col].dtype == "datetime64[ns]":
-    max_date = df[date_col].max()
-    min_date = max_date - pd.DateOffset(years=lookback_years)
-    df_view = df[df[date_col] >= min_date].copy()
-else:
-    # If date is fake index, just take last N rows
-    n = 252 * lookback_years
-    df_view = df.tail(n).copy()
-
-st.subheader(f"{symbol} price and model outputs")
-
-chart = make_price_chart(df_view, date_col, price_col, pred_cols)
-st.altair_chart(chart, use_container_width=True)
-
-# Metrics
-pred_col_for_metrics = pred_cols[0] if pred_cols else None
-metrics = compute_simple_metrics(df_view, price_col, pred_col_for_metrics)
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric(
-        "Last price",
-        f"{metrics.get('last_price'):.2f}" if metrics.get("last_price") is not None else "n/a",
+def main():
+    st.set_page_config(
+        page_title="Stock Prediction App",
+        layout="wide",
     )
 
-with col2:
-    if metrics.get("last_return") is not None:
-        st.metric(
-            "Last daily return",
-            f"{metrics['last_return'] * 100:.2f} %",
+    st.title("Neural Network Stock Prediction Demo")
+    st.write(
+        "This app visualises precomputed price data and a simple forecasting signal "
+        "for a universe of large liquid equities and indices."
+    )
+
+    # Sidebar
+    st.sidebar.header("Controls")
+
+    symbol = st.sidebar.selectbox("Select symbol", SYMBOLS, index=0)
+
+    st.sidebar.markdown("---")
+    last_n_days = st.sidebar.slider(
+        "Show last N days",
+        min_value=60,
+        max_value=1000,
+        value=365,
+        step=30,
+    )
+
+    st.sidebar.markdown(
+        """
+        **Note**  
+        Data and predictions are precomputed and loaded from CSV files in  
+        `data/outputs/*.csv`.
+        """
+    )
+
+    # Load data
+    df = load_symbol(symbol)
+
+    if df is None:
+        st.stop()
+
+    # Filter last N days
+    if "Date" in df.columns:
+        df = df.sort_values("Date").reset_index(drop=True)
+        if len(df) > last_n_days:
+            df_plot = df.iloc[-last_n_days:].copy()
+        else:
+            df_plot = df.copy()
+    else:
+        df_plot = df.copy()
+
+    # Compute metrics
+    metrics = compute_basic_metrics(df_plot)
+
+    # Top level layout
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.subheader(f"Price and prediction for {symbol}")
+        fig, ax = plt.subplots(figsize=(10, 5))
+
+        ax.plot(df_plot["Date"], df_plot["Close"], label="Actual Close", linewidth=1.4)
+        ax.plot(
+            df_plot["Date"],
+            df_plot["Predicted_Close"],
+            label="Forecast signal",
+            linestyle="--",
+            linewidth=1.2,
         )
-    else:
-        st.metric("Last daily return", "n/a")
 
-with col3:
-    if "rmse" in metrics:
-        st.metric("RMSE (test window)", f"{metrics['rmse']:.4f}")
-    else:
-        st.metric("RMSE (test window)", "n/a")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Price")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
 
-with col4:
-    if "directional_accuracy" in metrics:
+        st.pyplot(fig)
+
+    with col_right:
+        st.subheader("Summary metrics")
+
+        rmse = metrics["rmse"]
+        da = metrics["directional_accuracy"]
+        cum_ret = metrics["cum_return"]
+
+        st.metric("RMSE (price units)", f"{rmse:.4f}" if not np.isnan(rmse) else "N/A")
         st.metric(
             "Directional accuracy",
-            f"{metrics['directional_accuracy'] * 100:.2f} %",
+            f"{da * 100:.2f} %" if not np.isnan(da) else "N/A",
         )
-    else:
-        st.metric("Directional accuracy", "n/a")
+        st.metric(
+            "Buy and hold cumulative return",
+            f"{cum_ret * 100:.2f} %" if not np.isnan(cum_ret) else "N/A",
+        )
 
-st.markdown("### Raw data snapshot")
-st.dataframe(df_view.tail(20))
+        st.markdown("---")
+        st.markdown(
+            """
+            **Interpretation**
 
-st.caption(
-    "This is a static research demo built from your UROP neural network project. "
-    "All predictions are precomputed offline and loaded from CSV."
-)
+            - The forecast line is a simple next day signal derived from the price series.  
+            - RMSE measures average deviation between forecast and actual price.  
+            - Directional accuracy measures how often the sign of the move is predicted correctly.  
+            - Cumulative return is the result of passively holding the asset over the plotted window.
+            """
+        )
+
+    st.markdown("---")
+    with st.expander("Show raw data"):
+        st.dataframe(df_plot.tail(200))
+
+
+if __name__ == "__main__":
+    main()
